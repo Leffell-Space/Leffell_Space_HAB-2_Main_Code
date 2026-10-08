@@ -1,0 +1,606 @@
+#include <SD.h>
+#include <SPI.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <TinyGPS++.h>
+#include <Wire.h>
+#include <avr/pgmspace.h>
+#include <MS5611.h>
+#include "DFRobot_OzoneSensor.h"
+#include "config.h"
+
+// Defaults so this compiles even if config.h doesn't define the new flags
+#ifndef enable_BMI270
+#define enable_BMI270 1
+#endif
+#ifndef enable_INA226
+#define enable_INA226 1
+#endif
+#define enable_BMI270 1
+#define enable_INA226 1
+
+#if enable_BMI270
+#include "bmi270_config.h"   // Bosch config table
+#endif
+
+TinyGPSPlus gps;
+
+#if enable_TempSensors
+#define INSIDE 5   //inside temp
+#define OUTSIDE 6  //outside temp
+
+// Setup a oneWire instance to communicate with any OneWire devices
+OneWire in(INSIDE);
+OneWire out(OUTSIDE);
+
+// Pass our oneWire reference to Dallas Temperature sensor
+DallasTemperature sensors_in(&in);
+DallasTemperature sensors_out(&out);
+#endif
+
+File myFile;
+
+String dataFile = "data.csv";
+
+#if enable_Ozone
+#define COLLECT_NUMBER 20  // collect number, the collection range is 1-100
+#define Ozone_IICAddress OZONE_ADDRESS_3
+#endif
+
+#if enable_buzzer
+#define BUZZER_PIN 4  // Define buzzer pin
+#endif
+
+#if enable_Ozone
+DFRobot_OzoneSensor Ozone;
+#endif
+
+#if enable_MS5611
+MS5611 baro;
+#endif
+
+float pressure = 0;
+int16_t ozoneConcentration = 0;
+float insideCelsius = 0.0;
+float outsideCelsius = 0.0;
+
+//calibrated empirically
+float insideOffset = -0.2;
+float outsideOffset = -1.0;
+
+double latitude = 0.0;
+double longitude = 0.0;
+double altitude = 0.0;
+double hdop = 0.0;
+int hours = 0;
+int minutes = 0;
+int seconds = 0;
+unsigned long previousMillis = 0;
+unsigned long lastGPSRead = 0;
+
+// Read any waiting GPS bytes (called often so the 64-byte serial buffer never overflows)
+static inline void feedGPS() {
+  while (Serial1.available() > 0) {
+    gps.encode(Serial1.read());
+  }
+}
+
+// =====================================================================
+//                         INA226 POWER MONITOR
+// =====================================================================
+#if enable_INA226
+#define INA_ADDR            0x40
+#define INA_REG_CONFIG      0x00
+#define INA_REG_SHUNT_VOLT  0x01
+#define INA_REG_BUS_VOLT    0x02
+#define INA_REG_POWER       0x03
+#define INA_REG_CURRENT     0x04
+#define INA_REG_CALIB       0x05
+
+const float SHUNT_RESISTANCE_OHMS  = 0.01f;   // 10 mOhm
+const float MAX_EXPECTED_CURRENT_A = 10.0f;   // 10 A
+
+bool  inaOK = false;
+float inaCurrentLSB = 0.0f;   // A per bit
+float inaPowerLSB   = 0.0f;   // W per bit
+
+float busVoltageV = 0.0f;
+float currentmA   = 0.0f;
+float powerW      = 0.0f;
+
+static void inaWrite16(uint8_t reg, uint16_t value) {
+  Wire.beginTransmission(INA_ADDR);
+  Wire.write(reg);
+  Wire.write((uint8_t)(value >> 8));
+  Wire.write((uint8_t)(value & 0xFF));
+  Wire.endTransmission();
+}
+
+static uint16_t inaRead16(uint8_t reg) {
+  Wire.beginTransmission(INA_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)INA_ADDR, (uint8_t)2);
+  if (Wire.available() < 2) return 0;
+  uint16_t value = ((uint16_t)Wire.read() << 8);
+  value |= Wire.read();
+  return value;
+}
+
+static void inaSetup() {
+  Wire.beginTransmission(INA_ADDR);
+  inaOK = (Wire.endTransmission() == 0);
+  if (!inaOK) {
+#if debug
+    Serial.println("INA226 not found, continuing without it");
+#endif
+    return;
+  }
+
+  inaWrite16(INA_REG_CONFIG, 0x4FC7);
+
+  inaCurrentLSB = MAX_EXPECTED_CURRENT_A / 32768.0f;
+  float calibration = 0.00512f / (inaCurrentLSB * SHUNT_RESISTANCE_OHMS);
+  inaWrite16(INA_REG_CALIB, (uint16_t)(calibration + 0.5f));
+  inaPowerLSB = 25.0f * inaCurrentLSB;
+
+#if debug
+  Serial.println("INA226 configured");
+#endif
+}
+
+static void inaRead() {
+  if (!inaOK) return;
+  busVoltageV = inaRead16(INA_REG_BUS_VOLT) * 0.00125f;
+  currentmA   = (int16_t)inaRead16(INA_REG_CURRENT) * inaCurrentLSB * 1000.0f;
+  powerW      = inaRead16(INA_REG_POWER) * inaPowerLSB;
+}
+#endif  // enable_INA226
+
+// =====================================================================
+//                      BMI270 IMU (FIFO, 25 Hz)
+// =====================================================================
+#if enable_BMI270
+#define BMI_ADDR              0x68    // use 0x69 if SDO is tied to 3.3V
+#define IMU_POLL_MS           3000    // FIFO holds ~6.3 s at 25 Hz; drain well before that
+#define IMU_SAMPLE_PERIOD_MS  40      // 25 Hz
+
+// Accel +/-4 g, gyro +/-2000 dps
+static const float ACC_SCALE = 4.0f / 32768.0f;      // raw -> g
+static const float GYR_SCALE = 2000.0f / 32768.0f;   // raw -> deg/s
+
+#define REG_CHIP_ID         0x00
+#define REG_INTERNAL_STATUS 0x21
+#define REG_FIFO_LENGTH     0x24
+#define REG_FIFO_DATA       0x26
+#define REG_ACC_CONF        0x40
+#define REG_ACC_RANGE       0x41
+#define REG_GYR_CONF        0x42
+#define REG_GYR_RANGE       0x43
+#define REG_FIFO_CONFIG_0   0x48
+#define REG_FIFO_CONFIG_1   0x49
+#define REG_INIT_CTRL       0x59
+#define REG_INIT_ADDR_0     0x5B
+#define REG_INIT_DATA       0x5E
+#define REG_PWR_CONF        0x7C
+#define REG_PWR_CTRL        0x7D
+#define REG_CMD             0x7E
+
+const char imuFileName[] = "imu.csv";
+File imuFile;
+bool imuOK = false;
+unsigned long imuStartMs = 0;
+uint32_t imuSampleCount = 0;
+unsigned long lastImuPoll = 0;
+
+static bool bmiWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(BMI_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static bool bmiRead(uint8_t reg, uint8_t *buf, uint8_t n) {
+  Wire.beginTransmission(BMI_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)BMI_ADDR, n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) buf[i] = Wire.read();
+  return true;
+}
+
+static bool bmiUploadConfig() {
+  const uint16_t total = sizeof(bmi270_config_file);
+  const uint8_t CHUNK = 16;   // must be even
+
+  for (uint16_t i = 0; i < total; i += CHUNK) {
+    uint8_t n = (total - i > CHUNK) ? CHUNK : (uint8_t)(total - i);
+
+    uint16_t word = i / 2;
+    Wire.beginTransmission(BMI_ADDR);
+    Wire.write(REG_INIT_ADDR_0);
+    Wire.write((uint8_t)(word & 0x0F));
+    Wire.write((uint8_t)(word >> 4));
+    if (Wire.endTransmission() != 0) return false;
+
+    Wire.beginTransmission(BMI_ADDR);
+    Wire.write(REG_INIT_DATA);
+    for (uint8_t j = 0; j < n; j++) {
+      Wire.write(pgm_read_byte(&bmi270_config_file[i + j]));
+    }
+    if (Wire.endTransmission() != 0) return false;
+
+    feedGPS();
+  }
+  return true;
+}
+
+static bool bmiBegin() {
+  bmiWrite(REG_CMD, 0xB6);   // soft reset
+  delay(10);
+
+  uint8_t id = 0;
+  if (!bmiRead(REG_CHIP_ID, &id, 1) || id != 0x24) return false;
+
+  bmiWrite(REG_PWR_CONF, 0x00);   // advanced power save off
+  delay(1);
+  bmiWrite(REG_INIT_CTRL, 0x00);  // prepare for config load
+
+  if (!bmiUploadConfig()) return false;
+
+  bmiWrite(REG_INIT_CTRL, 0x01);  // finish config load
+
+  for (uint8_t t = 0; t < 30; t++) {
+    delay(10);
+    uint8_t st = 0;
+    if (bmiRead(REG_INTERNAL_STATUS, &st, 1) && (st & 0x0F) == 0x01) return true;
+  }
+  return false;
+}
+
+static void bmiSetup() {
+  imuOK = bmiBegin();
+  if (!imuOK) {
+#if debug
+    Serial.println("BMI270 init failed, continuing without it");
+#endif
+    return;
+  }
+
+  bmiWrite(REG_ACC_CONF,  0xA6);   // 25 Hz, normal filter, performance mode
+  bmiWrite(REG_ACC_RANGE, 0x01);   // +/-4 g
+  bmiWrite(REG_GYR_CONF,  0xA6);   // 25 Hz (lowest gyro rate)
+  bmiWrite(REG_GYR_RANGE, 0x00);   // +/-2000 dps
+  bmiWrite(REG_PWR_CTRL,  0x06);   // accel + gyro on
+  bmiWrite(REG_PWR_CONF,  0x02);   // adv. power save off, FIFO self-wakeup on
+  delay(50);
+
+  bmiWrite(REG_FIFO_CONFIG_0, 0x00);
+  bmiWrite(REG_FIFO_CONFIG_1, 0xD0);   // gyro_en | acc_en | header_en
+  bmiWrite(REG_CMD, 0xB0);             // flush FIFO
+  imuStartMs = millis();
+  imuSampleCount = 0;
+
+  imuFile = SD.open(imuFileName, FILE_WRITE);
+  if (imuFile) {
+    imuFile.println("sample,time_s,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps");
+    imuFile.close();
+  }
+#if debug
+  Serial.println("BMI270 FIFO enabled (25 Hz)");
+#endif
+}
+
+// ---- FIFO byte streamer (tiny RAM use) ----
+static uint8_t  fbuf[32];
+static uint8_t  fpos = 0, fcnt = 0;
+static uint16_t fremain = 0;
+
+static bool nextByte(uint8_t &b) {
+  if (fpos >= fcnt) {
+    if (fremain == 0) return false;
+    uint8_t n = (fremain > sizeof(fbuf)) ? sizeof(fbuf) : (uint8_t)fremain;
+
+    Wire.beginTransmission(BMI_ADDR);
+    Wire.write(REG_FIFO_DATA);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((uint8_t)BMI_ADDR, n) != n) return false;
+    for (uint8_t i = 0; i < n; i++) fbuf[i] = Wire.read();
+
+    fremain -= n;
+    fcnt = n;
+    fpos = 0;
+  }
+  b = fbuf[fpos++];
+  return true;
+}
+
+static bool skipBytes(uint8_t n) {
+  uint8_t d;
+  while (n--) if (!nextByte(d)) return false;
+  return true;
+}
+
+static bool readXYZ(int16_t v[3]) {
+  for (uint8_t i = 0; i < 3; i++) {
+    uint8_t lo, hi;
+    if (!nextByte(lo) || !nextByte(hi)) return false;
+    v[i] = (int16_t)(((uint16_t)hi << 8) | lo);
+  }
+  return true;
+}
+
+static void writeImuSample(const int16_t a[3], const int16_t g[3]) {
+  // Boot-relative time (same clock as Uptime_s in data.csv), written as seconds.milliseconds
+  unsigned long t_ms = imuStartMs + (unsigned long)imuSampleCount * IMU_SAMPLE_PERIOD_MS;
+  unsigned long ms = t_ms % 1000;
+
+  imuFile.print(imuSampleCount); imuFile.print(',');
+  imuFile.print(t_ms / 1000); imuFile.print('.');
+  if (ms < 100) imuFile.print('0');
+  if (ms < 10)  imuFile.print('0');
+  imuFile.print(ms); imuFile.print(',');
+  imuFile.print(a[0] * ACC_SCALE, 3); imuFile.print(',');
+  imuFile.print(a[1] * ACC_SCALE, 3); imuFile.print(',');
+  imuFile.print(a[2] * ACC_SCALE, 3); imuFile.print(',');
+  imuFile.print(g[0] * GYR_SCALE, 2); imuFile.print(',');
+  imuFile.print(g[1] * GYR_SCALE, 2); imuFile.print(',');
+  imuFile.println(g[2] * GYR_SCALE, 2);
+  imuSampleCount++;
+}
+
+static void drainImu() {
+  if (!imuOK) return;
+
+  uint8_t lb[2];
+  if (!bmiRead(REG_FIFO_LENGTH, lb, 2)) return;
+  uint16_t len = lb[0] | ((uint16_t)(lb[1] & 0x3F) << 8);
+  if (len == 0) return;
+
+#if debug
+  Serial.print("IMU FIFO bytes: ");
+  Serial.println(len);
+  if (len > 1900) Serial.println("WARNING: IMU FIFO nearly full, data may have been lost");
+#endif
+
+  imuFile = SD.open(imuFileName, FILE_WRITE);
+  if (!imuFile) {
+    // Can't save: skip this batch but keep the sample numbering/timestamps in step
+    imuSampleCount += len / 13;
+    bmiWrite(REG_CMD, 0xB0);
+    return;
+  }
+
+  fremain = len;
+  fpos = fcnt = 0;
+
+  uint8_t h;
+  while (nextByte(h)) {
+    if (h == 0x80) break;                       // empty / end of data
+
+    uint8_t mode = h & 0xC0;
+    if (mode == 0x80) {                         // regular data frame
+      int16_t g[3] = {0, 0, 0}, a[3] = {0, 0, 0};
+      if (h & 0x10) { if (!skipBytes(8)) break; }   // aux (unused)
+      if (h & 0x08) { if (!readXYZ(g))   break; }   // gyro first
+      if (h & 0x04) { if (!readXYZ(a))   break; }   // then accel
+      if ((h & 0x0C) == 0x0C) {
+        writeImuSample(a, g);
+        feedGPS();
+      }
+    }
+    else if (mode == 0x40) {                    // control frame
+      uint8_t p = (h >> 2) & 0x07, n;
+      if      (p == 0) n = 1;                   // skip frame
+      else if (p == 1) n = 3;                   // sensor time
+      else if (p == 2) n = 4;                   // input config
+      else break;
+      if (!skipBytes(n)) break;
+    }
+    else break;
+  }
+
+  imuFile.close();
+
+  // If we stopped early, clear the FIFO so the next read starts aligned
+  if (fremain > 0 || fpos < fcnt) bmiWrite(REG_CMD, 0xB0);
+}
+#endif  // enable_BMI270
+
+// =====================================================================
+//                               SETUP
+// =====================================================================
+void setup() {
+  Serial.begin(9600);
+  Serial1.begin(9600);  // Try different baud rate
+
+// SD Card Initialization
+#if debug
+  if (!SD.begin(53)) {
+    Serial.println("SD initialization failed!");
+  } else {
+    Serial.println("SD initialized successfully");
+  }
+#else
+  SD.begin(53);
+#endif
+
+#if debug
+  if (SD.exists(dataFile)) {
+    Serial.println("File exists");
+  } else {
+    Serial.println("Creating file");
+  }
+#endif
+
+  // Create/Open file
+  myFile = SD.open(dataFile, FILE_WRITE);
+  if (myFile) {
+    myFile.print("Time,Lat,Long,Alt,HDOP,Inside Temp,Outside Temp,Pressure,Ozone");
+#if enable_INA226
+    myFile.print(",Bus V,Current mA,Power W");
+#endif
+#if enable_BMI270
+    myFile.print(",Uptime_s");
+#endif
+    myFile.println();
+    myFile.flush();
+    myFile.close();
+#if debug
+    Serial.println("Header written to file");
+#endif
+  } else {
+#if debug
+    Serial.println("Error opening file");
+#endif
+  }
+
+  // Start I2C bus (barometer, ozone, INA226, BMI270 all share it)
+  Wire.begin();
+
+#if enable_MS5611
+  baro = MS5611();
+  baro.begin();
+#endif
+
+#if debug && enable_Ozone
+  if (!Ozone.begin(Ozone_IICAddress)) {
+    Serial.println("Ozone sensor I2c device number error!");
+  } else {
+    Serial.println("Ozone sensor working");
+  }
+#endif
+#if enable_Ozone
+  Ozone.begin(Ozone_IICAddress);
+  Ozone.setModes(MEASURE_MODE_PASSIVE);
+#endif
+
+// Start up the temperature sensors
+#if enable_TempSensors
+  sensors_in.begin();
+  sensors_out.begin();
+#endif
+
+#if enable_INA226
+  inaSetup();
+#endif
+
+#if enable_BMI270
+  bmiSetup();
+#endif
+
+#if enable_buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+#endif
+}
+
+// =====================================================================
+//                                LOOP
+// =====================================================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Continuously feed GPS data
+  feedGPS();
+
+#if enable_BMI270
+  // Drain the IMU FIFO every few seconds (independent of the 10 s logging cycle)
+  if (currentMillis - lastImuPoll >= IMU_POLL_MS) {
+    lastImuPoll = currentMillis;
+    drainImu();
+  }
+#endif
+
+// Check GPS status every 2 seconds
+#if wokwi_test
+  unsigned long gps_time = 1000;
+#else
+  unsigned long gps_time = 2000;
+#endif
+  if (currentMillis - lastGPSRead >= gps_time) {
+    lastGPSRead = currentMillis;
+
+    if (gps.location.isValid()) {
+      // Get location information
+      latitude = gps.location.lat();
+      longitude = gps.location.lng();
+      altitude = gps.altitude.meters();  // Altitude in meters
+      hdop = gps.hdop.hdop();            // Horizontal dilution of precision
+
+      // Get the timestamp (in hours, minutes, seconds)
+      hours = gps.time.hour();
+      minutes = gps.time.minute();
+      seconds = gps.time.second();
+    }
+  }
+
+// Read other sensors and process data every 10 seconds
+#if wokwi_test
+  unsigned long process_time = 1000;
+#else
+  unsigned long process_time = 10000;
+#endif
+  if (currentMillis - previousMillis >= process_time) {
+    previousMillis = currentMillis;
+
+#if enable_BMI270
+    // Empty the FIFO before the slow (blocking) sensor reads below
+    drainImu();
+    lastImuPoll = millis();
+#endif
+
+// Read pressure
+#if enable_MS5611
+    baro.read();
+    pressure = baro.getPressure();
+#endif
+
+#if enable_Ozone
+    ozoneConcentration = Ozone.readOzoneData(COLLECT_NUMBER);
+#endif
+
+#if enable_TempSensors
+    sensors_in.requestTemperatures();
+    insideCelsius = sensors_in.getTempCByIndex(0) + insideOffset;
+    sensors_out.requestTemperatures();
+    outsideCelsius = sensors_out.getTempCByIndex(0) + outsideOffset;
+#endif
+
+#if enable_INA226
+    inaRead();
+#endif
+
+#if enable_buzzer
+    if (altitude < 300 && currentMillis > 30000) {
+      digitalWrite(BUZZER_PIN, HIGH);
+    } else {
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+#endif
+
+    // Format and write data to SD as: Time,Lat,Long,Alt,HDOP,Inside Temp,Outside Temp,Pressure,Ozone[,Bus V,Current mA,Power W][,Uptime_s]
+    String timeStr = String(hours < 10 ? "0" : "") + String(hours) + ":" + String(minutes < 10 ? "0" : "") + String(minutes) + ":" + String(seconds < 10 ? "0" : "") + String(seconds);
+
+    String dataStr = timeStr + "," + String(latitude, 6) + "," + String(longitude, 6) + "," + String(altitude) + "," + String(hdop) + "," + String(insideCelsius) + "," + String(outsideCelsius) + "," + String(pressure) + "," + String(ozoneConcentration);
+
+#if enable_INA226
+    dataStr += "," + String(busVoltageV, 3) + "," + String(currentmA, 2) + "," + String(powerW, 3);
+#endif
+#if enable_BMI270
+    dataStr += "," + String(millis() / 1000.0, 2);
+#endif
+
+    myFile = SD.open(dataFile, FILE_WRITE);
+    if (myFile) {
+#if debug
+      Serial.println("Writing to SD: " + dataStr);
+#endif
+      myFile.println(dataStr);
+      myFile.close();
+    } else {
+#if debug
+      Serial.println("Error opening file for writing");
+#endif
+    }
+  }
+}
