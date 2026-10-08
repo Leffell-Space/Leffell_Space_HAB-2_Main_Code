@@ -1,0 +1,400 @@
+// imu_and_PS_combined_fixed.ino
+// BMI270 IMU + INA226 power sensor logger (INA at 0x44)
+
+#include <Wire.h>
+#include <avr/pgmspace.h>
+#include "bmi270_config.h"   // Bosch config table
+
+// ---------------- Settings ----------------
+#define USE_SD            0       // 1 = also log to SD card (CS pin 53)
+#define BMI_ADDR          0x68    // 0x69 if SDO is tied to 3.3V
+#define INA_ADDR          0x44    // <-- FOUND BY SCAN
+#define IMU_POLL_MS       3000    // FIFO holds ~6.3 s at 25 Hz; drain every 3 s
+#define POWER_POLL_MS     1000    // Power log period (ms)
+#define IMU_PERIOD_MS     40      // 25 Hz
+
+const float SHUNT_RESISTANCE_OHMS  = 0.01f;   // 10 mOhm
+const float MAX_EXPECTED_CURRENT_A = 10.0f;   // 10 A
+// ------------------------------------------
+
+#if USE_SD
+#include <SD.h>
+#include <SPI.h>
+File logFile;
+#endif
+
+// Accel +/-4 g, gyro +/-2000 dps
+static const float ACC_SCALE = 4.0f / 32768.0f;
+static const float GYR_SCALE = 2000.0f / 32768.0f;
+
+// ---------- BMI270 registers ----------
+#define REG_CHIP_ID         0x00
+#define REG_INTERNAL_STATUS 0x21
+#define REG_FIFO_LENGTH     0x24
+#define REG_FIFO_DATA       0x26
+#define REG_ACC_CONF        0x40
+#define REG_ACC_RANGE       0x41
+#define REG_GYR_CONF        0x42
+#define REG_GYR_RANGE       0x43
+#define REG_FIFO_CONFIG_0   0x48
+#define REG_FIFO_CONFIG_1   0x49
+#define REG_INIT_CTRL       0x59
+#define REG_INIT_ADDR_0     0x5B
+#define REG_INIT_DATA       0x5E
+#define REG_PWR_CONF        0x7C
+#define REG_PWR_CTRL        0x7D
+#define REG_CMD             0x7E
+
+// ---------- INA226 registers ----------
+#define INA_REG_CONFIG   0x00
+#define INA_REG_BUS      0x02
+#define INA_REG_POWER    0x03
+#define INA_REG_CURRENT  0x04
+#define INA_REG_CALIB    0x05
+
+bool  imuOK = false;
+bool  inaOK = false;
+float inaCurrentLSB = 0, inaPowerLSB = 0;
+uint32_t imuSampleCount = 0;
+unsigned long imuStartMs = 0;
+
+// =====================================================================
+//                              INA226
+// =====================================================================
+static void inaWrite16(uint8_t reg, uint16_t v)
+{
+  Wire.beginTransmission(INA_ADDR);
+  Wire.write(reg);
+  Wire.write((uint8_t)(v >> 8));
+  Wire.write((uint8_t)(v & 0xFF));
+  Wire.endTransmission();
+}
+
+static uint16_t inaRead16(uint8_t reg)
+{
+  Wire.beginTransmission(INA_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  if (Wire.requestFrom((uint8_t)INA_ADDR, (uint8_t)2) != 2) return 0;
+  uint16_t v = ((uint16_t)Wire.read() << 8);
+  v |= Wire.read();
+  return v;
+}
+
+static void inaSetup()
+{
+  Serial.println(F("Setting up INA226..."));
+  Wire.beginTransmission(INA_ADDR);
+  uint8_t err = Wire.endTransmission();
+  Serial.print(F("INA ping result (0=OK): "));
+  Serial.println(err);
+
+  inaOK = (err == 0);
+  if (!inaOK) {
+    Serial.print(F("INA226 NOT FOUND at 0x"));
+    Serial.println(INA_ADDR, HEX);
+    return;
+  }
+
+  // 16x averaging, ~1.1 ms shunt/bus conversions, continuous mode
+  inaWrite16(INA_REG_CONFIG, 0x4527);
+
+  inaCurrentLSB = MAX_EXPECTED_CURRENT_A / 32768.0f;
+  float cal = 0.00512f / (inaCurrentLSB * SHUNT_RESISTANCE_OHMS);
+  uint16_t calReg = (uint16_t)(cal + 0.5f);
+  inaWrite16(INA_REG_CALIB, calReg);
+
+  inaPowerLSB = 25.0f * inaCurrentLSB;
+
+  Serial.print(F("INA226 OK at 0x"));
+  Serial.print(INA_ADDR, HEX);
+  Serial.print(F(", CAL=0x"));
+  Serial.println(calReg, HEX);
+}
+
+static void printPower(Print &p, unsigned long t_ms)
+{
+  uint16_t rawBus     = inaRead16(INA_REG_BUS);
+  int16_t  rawCurrent = (int16_t)inaRead16(INA_REG_CURRENT);
+  uint16_t rawPower   = inaRead16(INA_REG_POWER);
+
+  float busV  = rawBus * 0.00125f;                   // 1.25 mV/LSB
+  float mA    = rawCurrent * inaCurrentLSB * 1000.0f;
+  float watts = rawPower * inaPowerLSB;
+
+  p.print(t_ms / 1000.0, 3); p.print(',');
+  p.print(busV, 3);          p.print(',');
+  p.print(mA, 2);            p.print(',');
+  p.print(watts, 3);         p.print(',');
+  p.print(rawBus);           p.print(',');
+  p.print(rawCurrent);       p.print(',');
+  p.println(rawPower);
+}
+
+static void logPower()
+{
+  if (!inaOK) return;
+  unsigned long t = millis();
+  Serial.print(F("PWR,"));
+  printPower(Serial, t);
+}
+
+// =====================================================================
+//                              BMI270
+// =====================================================================
+static bool bmiWrite(uint8_t reg, uint8_t val)
+{
+  Wire.beginTransmission(BMI_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  return Wire.endTransmission() == 0;
+}
+
+static bool bmiRead(uint8_t reg, uint8_t *buf, uint8_t n)
+{
+  Wire.beginTransmission(BMI_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)BMI_ADDR, n) != n) return false;
+  for (uint8_t i = 0; i < n; i++) buf[i] = Wire.read();
+  return true;
+}
+
+static bool bmiUploadConfig()
+{
+  const uint16_t total = sizeof(bmi270_config_file);
+  const uint8_t  CHUNK = 16;
+
+  for (uint16_t i = 0; i < total; i += CHUNK) {
+    uint8_t n = (total - i > CHUNK) ? CHUNK : (uint8_t)(total - i);
+
+    uint16_t word = i / 2;
+    Wire.beginTransmission(BMI_ADDR);
+    Wire.write(REG_INIT_ADDR_0);
+    Wire.write((uint8_t)(word & 0x0F));
+    Wire.write((uint8_t)(word >> 4));
+    if (Wire.endTransmission() != 0) return false;
+
+    Wire.beginTransmission(BMI_ADDR);
+    Wire.write(REG_INIT_DATA);
+    for (uint8_t j = 0; j < n; j++) {
+      Wire.write(pgm_read_byte(&bmi270_config_file[i + j]));
+    }
+    if (Wire.endTransmission() != 0) return false;
+  }
+  return true;
+}
+
+static bool bmiBegin()
+{
+  bmiWrite(REG_CMD, 0xB6);  // soft reset
+  delay(10);
+
+  uint8_t id = 0;
+  if (!bmiRead(REG_CHIP_ID, &id, 1)) {
+    Serial.println(F("BMI270 NOT FOUND (check wiring/address)"));
+    return false;
+  }
+  if (id != 0x24) {
+    Serial.print(F("BMI270 wrong chip ID: 0x"));
+    Serial.println(id, HEX);
+    return false;
+  }
+
+  bmiWrite(REG_PWR_CONF, 0x00);
+  delay(1);
+  bmiWrite(REG_INIT_CTRL, 0x00);
+
+  if (!bmiUploadConfig()) {
+    Serial.println(F("BMI270 config upload failed"));
+    return false;
+  }
+
+  bmiWrite(REG_INIT_CTRL, 0x01);
+
+  for (uint8_t t = 0; t < 30; t++) {
+    delay(10);
+    uint8_t st = 0;
+    if (bmiRead(REG_INTERNAL_STATUS, &st, 1) && (st & 0x0F) == 0x01) {
+      return true;
+    }
+  }
+  Serial.println(F("BMI270 init did not complete"));
+  return false;
+}
+
+static void bmiSetup()
+{
+  imuOK = bmiBegin();
+  if (!imuOK) return;
+
+  bmiWrite(REG_ACC_CONF,  0xA6);   // 25 Hz
+  bmiWrite(REG_ACC_RANGE, 0x01);   // +/-4 g
+  bmiWrite(REG_GYR_CONF,  0xA6);   // 25 Hz
+  bmiWrite(REG_GYR_RANGE, 0x00);   // +/-2000 dps
+  bmiWrite(REG_PWR_CTRL,  0x06);   // accel+gyro on
+  bmiWrite(REG_PWR_CONF,  0x02);   // adv. power save off, FIFO self-wakeup on
+  delay(50);
+
+  bmiWrite(REG_FIFO_CONFIG_0, 0x00);
+  bmiWrite(REG_FIFO_CONFIG_1, 0xD0);   // gyro_en | acc_en | header_en
+  bmiWrite(REG_CMD, 0xB0);             // flush FIFO
+
+  imuStartMs = millis();
+  Serial.println(F("BMI270 OK, FIFO enabled (25 Hz)"));
+}
+
+// ---- FIFO byte streamer ----
+static uint8_t  fbuf[32];
+static uint8_t  fpos = 0, fcnt = 0;
+static uint16_t fremain = 0;
+
+static bool nextByte(uint8_t &b)
+{
+  if (fpos >= fcnt) {
+    if (fremain == 0) return false;
+    uint8_t n = (fremain > sizeof(fbuf)) ? sizeof(fbuf) : (uint8_t)fremain;
+
+    Wire.beginTransmission(BMI_ADDR);
+    Wire.write(REG_FIFO_DATA);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((uint8_t)BMI_ADDR, n) != n) return false;
+    for (uint8_t i = 0; i < n; i++) fbuf[i] = Wire.read();
+
+    fremain -= n;
+    fcnt = n;
+    fpos = 0;
+  }
+  b = fbuf[fpos++];
+  return true;
+}
+
+static bool skipBytes(uint8_t n)
+{
+  uint8_t d;
+  while (n--) if (!nextByte(d)) return false;
+  return true;
+}
+
+static bool readXYZ(int16_t v[3])
+{
+  for (uint8_t i = 0; i < 3; i++) {
+    uint8_t lo, hi;
+    if (!nextByte(lo) || !nextByte(hi)) return false;
+    v[i] = (int16_t)(((uint16_t)hi << 8) | lo);
+  }
+  return true;
+}
+
+static void printImuSample(Print &p, const int16_t a[3], const int16_t g[3])
+{
+  unsigned long t_ms = imuStartMs + (unsigned long)imuSampleCount * IMU_PERIOD_MS;
+
+  p.print(imuSampleCount);      p.print(',');
+  p.print(t_ms / 1000.0, 3);    p.print(',');
+  p.print(a[0] * ACC_SCALE, 3); p.print(',');
+  p.print(a[1] * ACC_SCALE, 3); p.print(',');
+  p.print(a[2] * ACC_SCALE, 3); p.print(',');
+  p.print(g[0] * GYR_SCALE, 2); p.print(',');
+  p.print(g[1] * GYR_SCALE, 2); p.print(',');
+  p.println(g[2] * GYR_SCALE, 2);
+}
+
+static void drainImu()
+{
+  if (!imuOK) return;
+
+  uint8_t lb[2];
+  if (!bmiRead(REG_FIFO_LENGTH, lb, 2)) {
+    Serial.println(F("FIFO length read failed"));
+    return;
+  }
+  uint16_t len = lb[0] | ((uint16_t)(lb[1] & 0x3F) << 8);
+  if (len == 0) return;
+
+  Serial.print(F("# FIFO bytes: "));
+  Serial.println(len);
+  if (len > 1900) {
+    Serial.println(F("# WARNING: FIFO nearly full, data may have been lost"));
+  }
+
+  fremain = len;
+  fpos = fcnt = 0;
+
+  uint8_t h;
+  while (nextByte(h)) {
+    if (h == 0x80) break;
+
+    uint8_t mode = h & 0xC0;
+    if (mode == 0x80) {                      // regular data frame
+      int16_t g[3] = {0, 0, 0};
+      int16_t a[3] = {0, 0, 0};
+
+      if (h & 0x10) {                        // aux (unused)
+        if (!skipBytes(8)) break;
+      }
+      if (h & 0x08) {                        // gyro
+        if (!readXYZ(g)) break;
+      }
+      if (h & 0x04) {                        // accel
+        if (!readXYZ(a)) break;
+      }
+
+      if ((h & 0x0C) == 0x0C) {
+        Serial.print(F("IMU,"));
+        printImuSample(Serial, a, g);
+        imuSampleCount++;
+      }
+    } else if (mode == 0x40) {               // control frame
+      uint8_t p = (h >> 2) & 0x07;
+      uint8_t n;
+      if      (p == 0) n = 1;
+      else if (p == 1) n = 3;
+      else if (p == 2) n = 4;
+      else break;
+      if (!skipBytes(n)) break;
+    } else {
+      break;
+    }
+  }
+
+  if (fremain > 0 || fpos < fcnt) {
+    bmiWrite(REG_CMD, 0xB0);   // flush FIFO
+  }
+}
+
+// =====================================================================
+//                         Arduino entry points
+// =====================================================================
+void setup()
+{
+  Serial.begin(115200);
+  delay(500);
+  Serial.println(F("BOOT"));
+
+  Wire.begin();   // IMU and INA share this bus
+
+  inaSetup();
+  bmiSetup();
+
+  Serial.println(F("Format:"));
+  Serial.println(F("  PWR,time_s,bus_V,current_mA,power_W,rawBus,rawCurrent,rawPower"));
+  Serial.println(F("  IMU,sample,time_s,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps"));
+}
+
+void loop()
+{
+  static unsigned long lastImu = 0;
+  static unsigned long lastPwr = 0;
+  unsigned long now = millis();
+
+  if (now - lastPwr >= POWER_POLL_MS) {
+    lastPwr = now;
+    logPower();
+  }
+
+  if (now - lastImu >= IMU_POLL_MS) {
+    lastImu = now;
+    drainImu();
+  }
+}
